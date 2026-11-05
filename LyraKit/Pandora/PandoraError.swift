@@ -17,4 +17,12 @@ public struct PandoraError: Error, Sendable, Hashable {
     public static let invalidUsername = 1011
     public static let invalidPassword = 1012
     public static let noSeedsLeft = 1032
+    
+    // Additional error cases for the client implementation
+    public static let notAuthenticated = PandoraError(code: -1, message: "Not authenticated")
+    public static let invalidResponse = PandoraError(code: -2, message: "Invalid API response")
+    public static let serializationFailure = PandoraError(code: -3, message: "Serialization failure")
+    public static let invalidURL = PandoraError(code: -4, message: "Invalid URL")
+    public static let networkFailure = PandoraError(code: -5, message: "Network failure")
+    public static let apiFailure = PandoraError(code: -6, message: "API failure")
 }
