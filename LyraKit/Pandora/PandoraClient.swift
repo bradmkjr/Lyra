@@ -213,7 +213,7 @@ public actor PandoraClient {
                 trackToken: trackToken,
                 songName: songName,
                 artistName: artistName,
-                albumName: albumName,
+                albumName: albumName ?? "",
                 albumArtUrl: albumArtUrl,
                 songDetailUrl: songDetailUrl,
                 artistDetailUrl: artistDetailUrl,
