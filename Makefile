@@ -19,9 +19,10 @@ test:
 	$(XCB) $(COMMON_OPTS) -only-testing:LyraKitTests test
 
 # Release builds must be universal (arm64 + x86_64) so no Mac needs Rosetta.
+# LyraKit is linked statically, so the app executable is the only Mach-O to check.
 verify-arch: CONFIGURATION = Release
 verify-arch: lyra
-	@for bin in $(APP)/Contents/MacOS/Lyra $(APP)/Contents/Frameworks/LyraKit.framework/LyraKit; do \
+	@for bin in $(APP)/Contents/MacOS/Lyra; do \
 		archs=$$(lipo -archs $$bin); echo "$$bin: $$archs"; \
 		case "$$archs" in *arm64*x86_64*|*x86_64*arm64*) ;; *) echo "not universal"; exit 1;; esac; \
 	done

@@ -1,28 +1,52 @@
 import Foundation
 
-/// Error codes returned in the `code` field of a failed tuner API response.
-/// See https://6xq.net/pandora-apidoc/json/errorcodes/
-public struct PandoraError: Error, Sendable, Hashable {
-    public let code: Int
-    public let message: String?
+public enum PandoraError: Error, Sendable, Hashable {
+    /// The tuner API returned `"stat": "fail"`.
+    case api(code: Int, message: String)
+    /// An authenticated call was made before `login`.
+    case notAuthenticated
+    /// The response wasn't the JSON shape we expected.
+    case invalidResponse(String)
+    /// The server answered with a non-2xx HTTP status.
+    case http(statusCode: Int)
 
-    public init(code: Int, message: String? = nil) {
-        self.code = code
-        self.message = message
+    /// Error codes returned in the `code` field of a failed tuner API response.
+    /// See https://6xq.net/pandora-apidoc/json/errorcodes/
+    public enum Code {
+        public static let invalidSyncTime = 13
+        public static let invalidAuthToken = 1001
+        public static let invalidPartnerLogin = 1002
+        public static let invalidUsername = 1011
+        public static let invalidPassword = 1012
+        public static let listenerNotAuthorized = 1003
+        public static let playlistExceeded = 1039
+        public static let noSeedsLeft = 1032
     }
 
-    public static let invalidSyncTime = 13
-    public static let invalidAuthToken = 1001
-    public static let invalidPartnerLogin = 1002
-    public static let invalidUsername = 1011
-    public static let invalidPassword = 1012
-    public static let noSeedsLeft = 1032
-    
-    // Additional error cases for the client implementation
-    public static let notAuthenticated = PandoraError(code: -1, message: "Not authenticated")
-    public static let invalidResponse = PandoraError(code: -2, message: "Invalid API response")
-    public static let serializationFailure = PandoraError(code: -3, message: "Serialization failure")
-    public static let invalidURL = PandoraError(code: -4, message: "Invalid URL")
-    public static let networkFailure = PandoraError(code: -5, message: "Network failure")
-    public static let apiFailure = PandoraError(code: -6, message: "API failure")
+    public var code: Int? {
+        if case .api(let code, _) = self { code } else { nil }
+    }
+}
+
+extension PandoraError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .api(Code.invalidUsername, _), .api(Code.invalidPassword, _):
+            "Invalid email or password."
+        case .api(Code.invalidPartnerLogin, _):
+            "Pandora rejected this client. Try again later."
+        case .api(Code.playlistExceeded, _):
+            "You've requested too many playlists. Try again later."
+        case .api(Code.noSeedsLeft, _):
+            "A station must have at least one seed."
+        case .api(_, let message):
+            message
+        case .notAuthenticated:
+            "You're not signed in to Pandora."
+        case .invalidResponse:
+            "Pandora sent an unexpected response."
+        case .http(let status):
+            "Pandora returned HTTP \(status)."
+        }
+    }
 }

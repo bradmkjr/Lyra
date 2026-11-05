@@ -8,7 +8,6 @@
 
 /* Begin PBXBuildFile section */
 		A10000000000000000000001 /* LyraKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* LyraKit.framework */; };
-		A10000000000000000000002 /* LyraKit.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* LyraKit.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A10000000000000000000003 /* LyraKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* LyraKit.framework */; };
 /* End PBXBuildFile section */
 
@@ -35,20 +34,6 @@
 			remoteInfo = Lyra;
 		};
 /* End PBXContainerItemProxy section */
-
-/* Begin PBXCopyFilesBuildPhase section */
-		A40000000000000000000001 /* Embed Frameworks */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = "";
-			dstSubfolderSpec = 10;
-			files = (
-				A10000000000000000000002 /* LyraKit.framework in Embed Frameworks */,
-			);
-			name = "Embed Frameworks";
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		A20000000000000000000001 /* Lyra.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Lyra.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -152,7 +137,6 @@
 				AA0000000000000000000001 /* Sources */,
 				A60000000000000000000001 /* Frameworks */,
 				AB0000000000000000000001 /* Resources */,
-				A40000000000000000000001 /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
@@ -487,6 +471,7 @@
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
 				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				MACH_O_TYPE = staticlib;
 				GENERATE_INFOPLIST_FILE = YES;
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -513,6 +498,7 @@
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
 				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				MACH_O_TYPE = staticlib;
 				GENERATE_INFOPLIST_FILE = YES;
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
 				LD_RUNPATH_SEARCH_PATHS = (

@@ -16,7 +16,7 @@ public enum KeychainService {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
             kSecAttrAccount as String: username,
-            kSecValueData as String: password.data(using: .utf8)!,
+            kSecValueData as String: Data(password.utf8),
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked
         ]
         
@@ -32,10 +32,8 @@ public enum KeychainService {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: "",
             kSecReturnData as String: true,
             kSecReturnAttributes as String: true,
-            kSecReturnRef as String: false,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
         
@@ -72,7 +70,7 @@ public enum KeychainService {
 }
 
 /// Errors that can occur when working with the keychain.
-public enum KeychainError: Error, Equatable {
+public enum KeychainError: LocalizedError, Equatable {
     case invalidStatus(CInt)
     
     init(status: CInt) {

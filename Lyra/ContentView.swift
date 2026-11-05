@@ -1,51 +1,91 @@
 import LyraKit
 import SwiftUI
 
-struct ContentView: View {
-    @State private var selection: Station.ID?
-    private let stations: [Station] = []
+enum StationSheet: Identifiable, Hashable {
+    case new
+    case edit(Station)
 
-    var body: some View {
-        NavigationSplitView {
-            List(stations, selection: $selection) { station in
-                Text(station.stationName)
-            }
-            .overlay {
-                if stations.isEmpty {
-                    ContentUnavailableView("No Stations", systemImage: "radio",
-                                           description: Text("Sign in to Pandora to load your stations."))
-                }
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 220)
-        } detail: {
-            NowPlayingView()
+    var id: String {
+        switch self {
+        case .new: "new"
+        case .edit(let station): "edit-\(station.id)"
         }
     }
 }
 
-struct NowPlayingView: View {
+extension FocusedValues {
+    @Entry var stationSheet: Binding<StationSheet?>?
+}
+
+struct ContentView: View {
+    @Environment(AppModel.self) private var model
+
     var body: some View {
-        VStack(spacing: 16) {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(.quaternary)
-                .frame(width: 200, height: 200)
-                .overlay { Image(systemName: "music.note").font(.largeTitle).foregroundStyle(.secondary) }
-            Text("Nothing Playing").font(.title2)
-            HStack(spacing: 24) {
-                Button("Dislike", systemImage: "hand.thumbsdown") {}
-                Button("Play", systemImage: "play.fill") {}
-                Button("Next", systemImage: "forward.fill") {}
-                Button("Like", systemImage: "hand.thumbsup") {}
+        @Bindable var model = model
+        Group {
+            switch model.session {
+            case .signedOut, .signingIn:
+                LoginView()
+            case .signedIn:
+                MainView()
             }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.borderless)
-            .font(.title2)
-            .disabled(true)
         }
-        .padding()
+        .alert("Lyra", isPresented: Binding(
+            get: { model.errorMessage != nil || model.player.lastError != nil },
+            set: { if !$0 { model.errorMessage = nil; model.player.lastError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.errorMessage ?? model.player.lastError ?? "")
+        }
+    }
+}
+
+struct MainView: View {
+    @Environment(AppModel.self) private var model
+    @State private var sheet: StationSheet?
+    @State private var showsHistory = false
+
+    var body: some View {
+        NavigationSplitView {
+            StationListView(sheet: $sheet)
+                .navigationSplitViewColumnWidth(min: 200, ideal: 240)
+        } detail: {
+            HStack(spacing: 0) {
+                PlayerView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if showsHistory {
+                    Divider()
+                    HistoryView()
+                        .frame(width: 280)
+                        .transition(.move(edge: .trailing))
+                }
+            }
+            .toolbar {
+                ToolbarItem {
+                    Toggle(isOn: $showsHistory.animation()) {
+                        Label("History", systemImage: "clock.arrow.circlepath")
+                    }
+                    .keyboardShortcut("h", modifiers: [.command, .shift])
+                    .help("Show song history")
+                }
+            }
+        }
+        .focusedSceneValue(\.stationSheet, $sheet)
+        .sheet(item: $sheet) { sheet in
+            switch sheet {
+            case .new: NewStationView()
+            case .edit(let station): EditStationView(station: station)
+            }
+        }
+        .onKeyPress(.space) {
+            model.player.playPause()
+            return .handled
+        }
     }
 }
 
 #Preview {
     ContentView()
+        .environment(AppModel())
 }

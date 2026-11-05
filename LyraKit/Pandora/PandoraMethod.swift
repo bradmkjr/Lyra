@@ -19,8 +19,8 @@ public enum PandoraMethod: String, Sendable, CaseIterable {
     case deleteMusic = "station.deleteMusic"
 
     public static let apiPath = "/services/json/"
+    public static let apiVersion = "5"
 
-    /// Login calls go over TLS and the partner login is sent unencrypted.
-    public var requiresTLS: Bool { self == .partnerLogin || self == .userLogin || self == .getPlaylist }
+    /// Every body except the partner login is Blowfish-encrypted.
     public var isEncrypted: Bool { self != .partnerLogin }
 }

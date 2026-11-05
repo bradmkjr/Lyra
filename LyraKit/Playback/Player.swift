@@ -2,256 +2,270 @@ import AVFoundation
 import Foundation
 import Observation
 
-/// A player for Pandora audio streaming using AVQueuePlayer.
+/// Plays a Pandora station: fetches playlist fragments, prefetches the next one
+/// when the queue runs low, and keeps a short history (replaces Hermes's
+/// `AudioStreamer` + `ASPlaylist`).
+@MainActor
 @Observable
-public final class Player: NSObject {
-    /// The underlying AVQueuePlayer
-    private var avQueuePlayer: AVQueuePlayer
-    
-    /// Current playback state (playing, paused, stopped)
-    public var isPlaying: Bool = false
-    
-    /// Current playback position in seconds
-    public var currentTime: CMTime = .zero
-    
-    /// Total duration of current track in seconds
-    public var duration: CMTime = .zero
-    
-    /// Volume level (0.0 to 1.0)
-    public var volume: Float = 1.0 {
-        didSet {
-            avQueuePlayer.volume = volume
+public final class Player {
+    public private(set) var station: Station?
+    public private(set) var currentSong: Song?
+    /// Most recent first, including the current song.
+    public private(set) var history: [Song] = []
+    public private(set) var isPlaying = false
+    public private(set) var isBuffering = false
+    public private(set) var elapsed: TimeInterval = 0
+    public private(set) var duration: TimeInterval = 0
+    /// Last error worth showing to the user; the UI clears it.
+    public var lastError: String?
+
+    /// 0...1
+    public var volume: Float = 1 {
+        didSet { avPlayer.volume = volume }
+    }
+    /// Applies from the next song on.
+    public var quality: Song.Quality = .medium
+
+    public static let historyLimit = 20
+
+    @ObservationIgnored private let client: PandoraClient
+    @ObservationIgnored private let avPlayer = AVPlayer()
+    @ObservationIgnored private var queue: [Song] = []
+    @ObservationIgnored private var fetchTask: Task<Void, Never>?
+    @ObservationIgnored private var statusObservation: NSKeyValueObservation?
+    @ObservationIgnored private var itemObservation: NSKeyValueObservation?
+    @ObservationIgnored private var timeObserver: Any?
+    @ObservationIgnored private var endObserver: NSObjectProtocol?
+    @ObservationIgnored private lazy var nowPlaying = NowPlayingBridge(player: self)
+    /// Consecutive songs that failed to start; stops a skip loop when the network is down.
+    @ObservationIgnored private var consecutiveFailures = 0
+
+    public init(client: PandoraClient) {
+        self.client = client
+        avPlayer.automaticallyWaitsToMinimizeStalling = true
+
+        statusObservation = avPlayer.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] _, _ in
+            Task { @MainActor in self?.syncPlaybackState() }
         }
+        timeObserver = avPlayer.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.syncTime() }
+        }
+        endObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let finished = (note.object as AnyObject?).map(ObjectIdentifier.init)
+            MainActor.assumeIsolated {
+                guard let self, let current = self.avPlayer.currentItem,
+                      finished == ObjectIdentifier(current) else { return }
+                self.next()
+            }
+        }
+        nowPlaying.registerCommands()
     }
-    
-    /// Audio quality preference (low/medium/high)
-    public var audioQuality: AudioQuality = .high
-    
-    /// Current song being played
-    public var currentSong: Song?
-    
-    /// The current playback position as a Double in seconds
-    public var currentTimeSeconds: Double {
-        get { CMTimeGetSeconds(currentTime) }
-        set { seek(to: newValue) }
-    }
-    
-    /// The current duration as a Double in seconds
-    public var durationSeconds: Double {
-        get { CMTimeGetSeconds(duration) }
-        set { duration = CMTime(seconds: newValue, preferredTimescale: 1) }
-    }
-    
-    /// Indicates if the player is currently buffering
-    public var isBuffering: Bool = false
-    
-    /// Completion handler for when a track ends
-    public var onTrackEnd: (() -> Void)?
-    
-    /// Completion handler for when playback starts/stops
-    public var onPlaybackStateChange: ((Bool) -> Void)?
-    
-    // MARK: - Initialization
-    
-    /// Creates a new player instance.
-    public override init() {
-        avQueuePlayer = AVQueuePlayer()
-        super.init()
-        
-        avQueuePlayer.addObserver(self, forKeyPath: #keyPath(AVPlayer.timeControlStatus), options: [.new, .old], context: nil)
-        avQueuePlayer.addObserver(self, forKeyPath: #keyPath(AVPlayer.currentItem), options: [.new, .old], context: nil)
-        avQueuePlayer.addObserver(self, forKeyPath: #keyPath(AVPlayer.volume), options: [.new, .old], context: nil)
-        
-        // Handle AVPlayerItem status changes
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(playerItemDidReachEnd(_:)),
-            name: .AVPlayerItemDidPlayToEndTime,
-            object: nil
-        )
-    }
-    
-    // MARK: - Public Methods
-    
-    /// Starts playback of a song
-    public func play(song: Song) {
-        // Create an AVPlayerItem with the song's audio URL
-        guard let audioURL = getAudioURL(for: song) else {
+
+    // MARK: - Transport
+
+    /// Starts `station`, or resumes it if it is already loaded.
+    public func play(station: Station) {
+        if station.id == self.station?.id, currentSong != nil {
+            resume()
             return
         }
-        
-        // Create new item and add it to queue if this is a new song
-        if currentSong?.trackToken != song.trackToken {
-            let playerItem = AVPlayerItem(url: audioURL)
-            avQueuePlayer.replaceCurrentItem(with: playerItem)
-            currentSong = song
-        }
-        
-        // Ensure we start playing after replacing the item
-        avQueuePlayer.play()
-        isPlaying = true
-        onPlaybackStateChange?(true)
+        stopPlayback()
+        self.station = station
+        queue = []
+        fetchTask?.cancel()
+        fetchTask = nil
+        Task { await advance() }
     }
-    
-    /// Starts playback from a list of songs
-    public func play(songs: [Song]) {
-        let playerItems = songs.compactMap { song in
-            guard let audioURL = getAudioURL(for: song) else { return nil }
-            return AVPlayerItem(url: audioURL)
-        }
-        
-        avQueuePlayer.removeAllItems()
-        avQueuePlayer.insert(playerItems, after: nil)
-        currentSong = songs.first
-        
-        if !playerItems.isEmpty {
-            avQueuePlayer.play()
-            isPlaying = true
-            onPlaybackStateChange?(true)
-        }
-    }
-    
-    /// Pauses playback
-    public func pause() {
-        avQueuePlayer.pause()
-        isPlaying = false
-        onPlaybackStateChange?(false)
-    }
-    
-    /// Resumes playback
-    public func resume() {
-        guard isPlaying == false else { return }
-        
-        avQueuePlayer.play()
-        isPlaying = true
-        onPlaybackStateChange?(true)
-    }
-    
-    /// Stops playback
-    public func stop() {
-        avQueuePlayer.pause()
-        avQueuePlayer.replaceCurrentItem(with: nil)
-        currentSong = nil
-        isPlaying = false
-        onPlaybackStateChange?(false)
-    }
-    
-    /// Skips to the next song in the queue
-    public func skip() {
-        avQueuePlayer.advanceToNextItem()
-        
-        // If there's a next item, start playing it
-        if let nextItem = avQueuePlayer.items().first {
-            // Update current time tracking
-            updateTimeObserver()
-        }
-    }
-    
-    /// Seeks to a specific position in the current track
-    public func seek(to seconds: Double) {
-        let seekTime = CMTime(seconds: seconds, preferredTimescale: 1)
-        avQueuePlayer.seek(to: seekTime)
-    }
-    
-    /// Sets the audio quality preference and updates if currently playing
-    public func setAudioQuality(_ quality: AudioQuality) {
-        audioQuality = quality
-        // If currently playing, we may need to refetch or re-initialize with new quality
-    }
-    
-    /// Prefetches the next playlist when needed
-    public func prefetchNextPlaylist(stationId: String, currentPlaylist: [Song], completion: @escaping (Result<[Song], Error>) -> Void) {
-        // This would typically be implemented by fetching new songs from the Pandora API
-        // and preparing them for playback before they're about to be played
-        print("Prefetching next playlist (stub: not yet implemented)")
-        completion(.success([]))
-    }
-    
-    /// Gets the audio URL for a song based on quality preference
-    private func getAudioURL(for song: Song) -> URL? {
-        // Use our quality preference to select appropriate audio URL
-        guard let audioUrlMap = song.audioUrlMap else { return nil }
-        
-        var selectedQuality: String?
-        
-        switch audioQuality {
-        case .high:
-            if audioUrlMap["highQuality"] != nil {
-                selectedQuality = "highQuality"
-            } else if audioUrlMap["mediumQuality"] != nil {
-                selectedQuality = "mediumQuality"
-            } else {
-                selectedQuality = "lowQuality"
-            }
-        case .medium:
-            if audioUrlMap["mediumQuality"] != nil {
-                selectedQuality = "mediumQuality"
-            } else {
-                selectedQuality = "highQuality" // fallback
-            }
-        case .low:
-            selectedQuality = "lowQuality"
-        }
-        
-        return selectedQuality.flatMap { audioUrlMap[$0]?.audioUrl }
-    }
-    
-    // MARK: - Private Methods
-    
-    /// Updates the time tracking and observer
-    private func updateTimeObserver() {
-        currentTime = avQueuePlayer.currentTime()
-        duration = avQueuePlayer.currentItem?.duration ?? .zero
-    }
-    
-    // MARK: - Observer Handling
-    
-    /// Handles AVPlayer value changes
-    public override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
-        guard let keyPath = keyPath else { return }
-        
-        switch keyPath {
-        case #keyPath(AVPlayer.timeControlStatus):
-            // Handle playback state changes
-            if avQueuePlayer.timeControlStatus == .playing {
-                isPlaying = true
-            } else if avQueuePlayer.timeControlStatus == .paused || avQueuePlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate {
-                isPlaying = false
-            }
-            
-        case #keyPath(AVPlayer.currentItem):
-            // Update current time and duration when item changes
-            updateTimeObserver()
-            
-        case #keyPath(AVPlayer.volume):
-            volume = avQueuePlayer.volume
-            
-        default:
-            break
-        }
-    }
-    
-    /// Handles when a player item finishes playing
-    @objc private func playerItemDidReachEnd(_ notification: Notification) {
-        if let playerItem = notification.object as? AVPlayerItem,
-           playerItem == avQueuePlayer.currentItem {
-            // Call the completion handler when track ends
-            onTrackEnd?()
-        }
-    }
-    
-    /// Cleans up resources when the player is deallocated
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-        avQueuePlayer.removeObserver(self, forKeyPath: #keyPath(AVPlayer.timeControlStatus))
-        avQueuePlayer.removeObserver(self, forKeyPath: #keyPath(AVPlayer.currentItem))
-        avQueuePlayer.removeObserver(self, forKeyPath: #keyPath(AVPlayer.volume))
-    }
-}
 
-/// Audio quality levels
-public enum AudioQuality {
-    case low
-    case medium
-    case high
+    public func resume() {
+        guard currentSong != nil else {
+            if station != nil { Task { await advance() } }
+            return
+        }
+        avPlayer.play()
+    }
+
+    public func pause() {
+        avPlayer.pause()
+    }
+
+    public func playPause() {
+        isPlaying ? pause() : resume()
+    }
+
+    public func next() {
+        Task { await advance() }
+    }
+
+    /// Stops playback and forgets the station (sign-out).
+    public func stop() {
+        stopPlayback()
+        station = nil
+        queue = []
+        history = []
+        fetchTask?.cancel()
+        fetchTask = nil
+    }
+
+    public func increaseVolume() { volume = min(1, volume + 0.1) }
+    public func decreaseVolume() { volume = max(0, volume - 0.1) }
+
+    // MARK: - Feedback
+
+    /// Likes `song` (the current song by default), or removes the like if already liked.
+    public func toggleLike(_ song: Song? = nil) async {
+        guard let song = song ?? currentSong else { return }
+        if song.isLiked {
+            await perform { try await self.client.removeRating(song) }
+            setRating(0, for: song)
+        } else {
+            await perform { try await self.client.rate(song, liked: true) }
+            setRating(1, for: song)
+        }
+    }
+
+    /// Dislikes `song`; if it's playing, skips it.
+    public func dislike(_ song: Song? = nil) async {
+        guard let song = song ?? currentSong else { return }
+        if song.trackToken == currentSong?.trackToken { next() }
+        await perform { try await self.client.rate(song, liked: false) }
+        setRating(-1, for: song)
+    }
+
+    /// Tells Pandora not to play this song for a month, and skips it.
+    public func tired() async {
+        guard let song = currentSong else { return }
+        next()
+        await perform { try await self.client.sleep(song) }
+    }
+
+    private func perform(_ operation: @escaping @Sendable () async throws -> Void) async {
+        do {
+            try await operation()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func setRating(_ rating: Int, for song: Song) {
+        if currentSong?.trackToken == song.trackToken {
+            currentSong?.songRating = rating
+            nowPlaying.update()
+        }
+        for index in history.indices where history[index].trackToken == song.trackToken {
+            history[index].songRating = rating
+        }
+    }
+
+    // MARK: - Queue
+
+    private func advance() async {
+        if queue.isEmpty { await refill() }
+        guard let song = queue.first else {
+            stopPlayback()
+            return
+        }
+        queue.removeFirst()
+        start(song)
+        if queue.count < 2 {
+            Task { await refill() }
+        }
+    }
+
+    /// Fetches the next playlist fragment; concurrent callers share one request.
+    private func refill() async {
+        if let fetchTask {
+            await fetchTask.value
+            return
+        }
+        guard let station else { return }
+        let task = Task {
+            do {
+                let songs = try await client.playlist(for: station)
+                guard self.station?.id == station.id else { return }
+                queue += songs
+            } catch is CancellationError {
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        fetchTask = task
+        await task.value
+        if fetchTask == task { fetchTask = nil }
+    }
+
+    private func start(_ song: Song) {
+        guard let url = song.audioURL(for: quality) else {
+            failed(song)
+            return
+        }
+        currentSong = song
+        elapsed = 0
+        duration = 0
+        history.removeAll { $0.trackToken == song.trackToken }
+        history.insert(song, at: 0)
+        if history.count > Self.historyLimit { history.removeLast(history.count - Self.historyLimit) }
+
+        let item = AVPlayerItem(url: url)
+        itemObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            guard item.status == .failed else {
+                if item.status == .readyToPlay { Task { @MainActor in self?.consecutiveFailures = 0 } }
+                return
+            }
+            Task { @MainActor in self?.failed(song) }
+        }
+        avPlayer.replaceCurrentItem(with: item)
+        avPlayer.volume = volume
+        avPlayer.play()
+        nowPlaying.update()
+    }
+
+    /// Pandora stream URLs expire after a while; skip songs that won't load.
+    private func failed(_ song: Song) {
+        guard song.trackToken == currentSong?.trackToken || currentSong == nil else { return }
+        consecutiveFailures += 1
+        if consecutiveFailures >= 3 {
+            consecutiveFailures = 0
+            lastError = "Couldn't load audio from Pandora. Check your connection."
+            queue = []
+            stopPlayback()
+            return
+        }
+        // Expired URLs usually mean the whole queued fragment is stale.
+        queue = []
+        next()
+    }
+
+    private func stopPlayback() {
+        avPlayer.pause()
+        avPlayer.replaceCurrentItem(with: nil)
+        itemObservation = nil
+        currentSong = nil
+        elapsed = 0
+        duration = 0
+        nowPlaying.update()
+    }
+
+    // MARK: - AVPlayer sync
+
+    private func syncPlaybackState() {
+        isPlaying = avPlayer.timeControlStatus == .playing
+        isBuffering = avPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        nowPlaying.update()
+    }
+
+    private func syncTime() {
+        let seconds = avPlayer.currentTime().seconds
+        elapsed = seconds.isFinite ? seconds : 0
+        if let itemDuration = avPlayer.currentItem?.duration.seconds, itemDuration.isFinite {
+            if duration != itemDuration {
+                duration = itemDuration
+                nowPlaying.update()
+            }
+        }
+    }
 }

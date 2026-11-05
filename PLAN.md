@@ -38,6 +38,8 @@ Lyra.xcodeproj
 
 Build settings shared by all targets:
 
+- **LyraKit is a static framework** linked into the app binary. A dynamic one fails
+  library validation under hardened runtime when ad-hoc signed (no Team ID).
 - **Architectures:** `$(ARCHS_STANDARD)` → `arm64 x86_64` universal for Release;
   Debug builds only the active arch. No Rosetta at any point.
 - **Deployment target:** macOS 14.0 (Sonoma) — gives us `@Observable`,
@@ -56,7 +58,7 @@ Build settings shared by all targets:
       verified against Hermes's C implementation
 - [x] Model and API-method stubs; placeholder SwiftUI UI
 
-### Phase 1 — Pandora API core (LyraKit)
+### Phase 1 — Pandora API core (LyraKit) ✅
 - `PandoraClient` actor: request building (`/services/json/?method=…&partner_id=…&auth_token=…&user_id=…`),
   TLS vs. non-TLS methods, encrypted bodies, `syncTime` handling.
 - `auth.partnerLogin` → `auth.userLogin`, with Hermes's fallback to the desktop
@@ -66,14 +68,14 @@ Build settings shared by all targets:
 - Keychain credential storage (`SecItem*`).
 - Tests with a `URLProtocol` stub replaying recorded JSON.
 
-### Phase 2 — Playback
+### Phase 2 — Playback ✅
 - `Player` (`@Observable`) on `AVQueuePlayer`: prefetch next playlist when
   the queue runs low, skip, pause/resume, volume, progress, audio quality pref
   (low/medium/high per Hermes).
 - Handle expired track URLs (Pandora links time out) by refetching.
 - `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` (replaces SPMediaKeyTap).
 
-### Phase 3 — UI parity
+### Phase 3 — UI parity ✅
 - Login sheet, station list (sort by name/date, filter), now-playing view with
   art, like/dislike/tired, volume, progress.
 - History list with like/dislike from history; open song/artist/album on Pandora.
@@ -96,6 +98,11 @@ Build settings shared by all targets:
 - Sparkle 2 via SPM, EdDSA-signed appcast.
 - Developer ID signing + notarization script (replaces `Scripts/*.sh`).
 - `lipo -archs` check in CI to guarantee `arm64 x86_64`.
+
+### Known gaps after Phase 3
+- Not yet verified against the live Pandora service (needs a real account); the wire
+  format is covered by `PandoraClientTransportTests` against a fake tuner.
+- Proxy settings and an explicit "toolbar hide" toggle from Hermes are not ported.
 
 ## Open questions
 - Sparkle vs. Mac App Store only? (Sandbox + Sparkle 2 needs its XPC services.)

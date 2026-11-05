@@ -16,7 +16,26 @@ struct SongTests {
         """
         let song = try JSONDecoder().decode(Song.self, from: Data(json.utf8))
         #expect(song.audioURL(for: .low)?.lastPathComponent == "low.mp4")
-        // Missing medium quality falls back to the best available.
-        #expect(song.audioURL(for: .medium)?.lastPathComponent == "high.mp4")
+        // Missing medium quality falls back to low, as in Hermes.
+        #expect(song.audioURL(for: .medium)?.lastPathComponent == "low.mp4")
+        #expect(song.audioURL(for: .high)?.lastPathComponent == "high.mp4")
+        #expect(song.isLiked)
+    }
+
+    @Test func additionalAudioUrlFillsQualitiesAndEmptyURLsAreIgnored() throws {
+        let json = """
+        {
+          "trackToken": "t2", "songName": "S", "artistName": "A", "albumName": "B",
+          "albumArtUrl": "",
+          "additionalAudioUrl": ["https://e.com/32", "https://e.com/64", "https://e.com/128"],
+          "audioUrlMap": {"highQuality": {"audioUrl": "https://e.com/192", "bitrate": "192"}}
+        }
+        """
+        let song = try JSONDecoder().decode(Song.self, from: Data(json.utf8))
+        #expect(song.albumArtUrl == nil)
+        #expect(song.audioURL(for: .low)?.lastPathComponent == "32")
+        #expect(song.audioURL(for: .medium)?.lastPathComponent == "64")
+        // A higher bitrate from audioUrlMap wins.
+        #expect(song.audioURL(for: .high)?.lastPathComponent == "192")
     }
 }

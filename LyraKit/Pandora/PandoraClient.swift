@@ -1,362 +1,318 @@
 import Foundation
-import Security
 
-/// Main client for interacting with the Pandora API.
+/// Pandora tuner API (v5) client, ported from Hermes's `Pandora.m`.
+///
+/// Sign-in is two steps: `auth.partnerLogin` (unencrypted, yields the partner token
+/// and an encrypted server time), then `auth.userLogin`. Every later call sends
+/// `userAuthToken` + `syncTime` in a Blowfish-encrypted body and the ids in the URL.
 public actor PandoraClient {
-    /// Authentication state for the client.
-    public struct AuthState: Sendable, Hashable {
-        public var partnerId: String
-        public var userId: String
-        public var authToken: String
-        
-        public init(partnerId: String, userId: String, authToken: String) {
-            self.partnerId = partnerId
-            self.userId = userId
-            self.authToken = authToken
-        }
-    }
-    
-    /// Current authentication state.
-    private var authState: AuthState?
-    
-    /// Timestamp synchronization data for the client.
-    private var syncTime: Int64?
-    
-    /// The device used to communicate with Pandora.
-    private let device: PandoraDevice
-    
-    /// URL session for network requests.
-    private let urlSession: URLSession
-    
-    /// Creates a new PandoraClient.
-    public init(device: PandoraDevice = .iPhone) {
+    private let defaultDevice: PandoraDevice
+    private var device: PandoraDevice
+    private let session: URLSession
+
+    private var partnerId: String?
+    private var partnerAuthToken: String?
+    private var userId: String?
+    private var userAuthToken: String?
+    private var syncTime: Int64 = 0
+    private var syncStart = Date()
+    /// Kept so an expired auth token can be renewed transparently.
+    private var credentials: (username: String, password: String)?
+
+    public private(set) var isSubscriber = false
+
+    public init(device: PandoraDevice = .android, session: URLSession = .shared) {
+        self.defaultDevice = device
         self.device = device
-        self.urlSession = URLSession.shared
+        self.session = session
     }
-    
-    /// Performs partner login with the given device credentials.
-    public func partnerLogin() async throws -> AuthState {
-        let params = [
-            "method": "auth.partnerLogin",
-            "partner_id": device.username,
-            "password": device.password,
-            "device_id": device.deviceID,
-            "version": "5"
-        ]
-        
-        let response = try await makeRequest(params: params)
-        guard let partnerInfo = response["partnerInfo"] as? [String: Any],
-              let partnerId = partnerInfo["partnerId"] as? String,
-              let authToken = response["authToken"] as? String else {
-            throw PandoraError.invalidResponse
-        }
-        
-        // Parse syncTime if available
-        if let time = response["syncTime"] as? Int {
-            self.syncTime = Int64(time)
-        }
-        
-        let authState = AuthState(partnerId: partnerId, userId: "", authToken: authToken)
-        self.authState = authState
-        
-        return authState
+
+    public var isAuthenticated: Bool { userAuthToken != nil }
+
+    // MARK: - Authentication
+
+    public func login(username: String, password: String) async throws {
+        logout()
+        try await performLogin(username: username, password: password)
+        credentials = (username, password)
     }
-    
-    /// Performs user login with username and password.
-    public func userLogin(username: String, password: String) async throws -> AuthState {
-        let params = [
-            "method": "auth.userLogin",
+
+    public func logout() {
+        resetSession()
+        credentials = nil
+        isSubscriber = false
+        device = defaultDevice
+    }
+
+    private func resetSession() {
+        partnerId = nil
+        partnerAuthToken = nil
+        userId = nil
+        userAuthToken = nil
+        syncTime = 0
+    }
+
+    private func performLogin(username: String, password: String) async throws {
+        try await partnerLogin()
+
+        struct UserLogin: Decodable, Sendable {
+            let userId: String
+            let userAuthToken: String
+            let isSubscriber: Bool?
+        }
+        let result: UserLogin = try await send(.userLogin, body: [
+            "loginType": "user",
             "username": username,
             "password": password,
-            "auth_token": authState?.authToken ?? "",
-            "partner_id": device.username
-        ]
-        
-        let response = try await makeRequest(params: params)
-        guard let userInfo = response["userInfo"] as? [String: Any],
-              let userId = userInfo["userId"] as? String,
-              let authToken = response["authToken"] as? String else {
-            throw PandoraError.invalidResponse
-        }
-        
-        // Parse syncTime if available
-        if let time = response["syncTime"] as? Int {
-            self.syncTime = Int64(time)
-        }
-        
-        let authState = AuthState(partnerId: device.username, userId: userId, authToken: authToken)
-        self.authState = authState
-        
-        return authState
-    }
-    
-    /// Gets the list of stations for the current user.
-    public func getStationList() async throws -> [Station] {
-        guard let authState else {
-            throw PandoraError.notAuthenticated
-        }
-        
-        let params = [
-            "method": "user.getStationList",
-            "auth_token": authState.authToken,
-            "user_id": authState.userId
-        ]
-        
-        let response = try await makeRequest(params: params)
-        guard let stations = response["stations"] as? [[String: Any]] else {
-            throw PandoraError.invalidResponse
-        }
-        
-        return try stations.map { stationData in
-            guard let stationId = stationData["stationId"] as? String,
-                  let stationToken = stationData["stationToken"] as? String,
-                  let stationName = stationData["stationName"] as? String else {
-                throw PandoraError.invalidResponse
-            }
-            
-            var isQuickMix: Bool?
-            if let quickMix = stationData["isQuickMix"] as? Bool {
-                isQuickMix = quickMix
-            }
-            
-            var dateCreated: PandoraDate?
-            if let created = stationData["dateCreated"] as? Int {
-                dateCreated = PandoraDate(time: Int64(created))
-            }
-            
-            return Station(
-                stationId: stationId,
-                stationToken: stationToken,
-                stationName: stationName
-            )
+            "partnerAuthToken": partnerAuthToken ?? "",
+            "syncTime": currentSyncTime,
+            "returnIsSubscriber": true,
+        ])
+        userId = result.userId
+        userAuthToken = result.userAuthToken
+        isSubscriber = result.isSubscriber ?? false
+
+        // Subscribers get higher-quality streams through the desktop partner (as in Hermes).
+        if isSubscriber && device != .desktop {
+            device = .desktop
+            resetSession()
+            try await performLogin(username: username, password: password)
         }
     }
-    
-    /// Gets a playlist for the given station.
-    public func getPlaylist(stationId: String) async throws -> [Song] {
-        guard let authState else {
-            throw PandoraError.notAuthenticated
+
+    private func partnerLogin() async throws {
+        struct PartnerLogin: Decodable, Sendable {
+            let partnerId: String
+            let partnerAuthToken: String
+            let syncTime: String
         }
-        
-        let params = [
-            "method": "station.getPlaylist",
-            "auth_token": authState.authToken,
-            "user_id": authState.userId,
-            "station_id": stationId
-        ]
-        
-        let response = try await makeRequest(params: params)
-        guard let songs = response["items"] as? [[String: Any]] else {
-            throw PandoraError.invalidResponse
+        let result: PartnerLogin = try await send(.partnerLogin, body: [
+            "username": device.username,
+            "password": device.password,
+            "deviceModel": device.deviceID,
+            "version": PandoraMethod.apiVersion,
+            "includeUrls": true,
+        ])
+        partnerId = result.partnerId
+        partnerAuthToken = result.partnerAuthToken
+        syncTime = try Self.decodeSyncTime(result.syncTime, key: device.decryptKey)
+        syncStart = Date()
+    }
+
+    /// The partner login's `syncTime` is encrypted; after 4 junk bytes come ASCII digits.
+    static func decodeSyncTime(_ hex: String, key: String) throws -> Int64 {
+        let plain = try PandoraCrypto.decrypt(hex: hex, key: key)
+        let digits = plain.dropFirst(4).prefix { (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) }
+        guard let value = Int64(String(decoding: digits, as: UTF8.self)) else {
+            throw PandoraError.invalidResponse("Undecodable syncTime")
         }
-        
-        return try songs.map { songData in
-            guard let trackToken = songData["trackToken"] as? String,
-                  let songName = songData["songName"] as? String,
-                  let artistName = songData["artistName"] as? String else {
-                throw PandoraError.invalidResponse
-            }
-            
-            var albumName: String?
-            if let name = songData["albumName"] as? String {
-                albumName = name
-            }
-            
-            var albumArtUrl: URL?
-            if let url = songData["albumArtUrl"] as? String, let urlObject = URL(string: url) {
-                albumArtUrl = urlObject
-            }
-            
-            var songDetailUrl: URL?
-            if let url = songData["songDetailUrl"] as? String, let urlObject = URL(string: url) {
-                songDetailUrl = urlObject
-            }
-            
-            var artistDetailUrl: URL?
-            if let url = songData["artistDetailUrl"] as? String, let urlObject = URL(string: url) {
-                artistDetailUrl = urlObject
-            }
-            
-            var albumDetailUrl: URL?
-            if let url = songData["albumDetailUrl"] as? String, let urlObject = URL(string: url) {
-                albumDetailUrl = urlObject
-            }
-            
-            var songRating: Int?
-            if let rating = songData["songRating"] as? Int {
-                songRating = rating
-            }
-            
-            var trackGain: String?
-            if let gain = songData["trackGain"] as? String {
-                trackGain = gain
-            }
-            
-            // Handle audio URL map
-            var audioUrlMap: [String: Song.AudioURL]?
-            if let audioUrls = songData["audioUrlMap"] as? [[String: Any]] {
-                audioUrlMap = [:]
-                for urlData in audioUrls {
-                    if let quality = urlData["quality"] as? String,
-                       let audioUrl = urlData["audioUrl"] as? String,
-                       let urlObject = URL(string: audioUrl) {
-                        audioUrlMap?[quality] = Song.AudioURL(
-                            audioUrl: urlObject,
-                            bitrate: urlData["bitrate"] as? String,
-                            encoding: urlData["encoding"] as? String
-                        )
-                    }
-                }
-            }
-            
-            return Song(
-                trackToken: trackToken,
-                songName: songName,
-                artistName: artistName,
-                albumName: albumName ?? "",
-                albumArtUrl: albumArtUrl,
-                songDetailUrl: songDetailUrl,
-                artistDetailUrl: artistDetailUrl,
-                albumDetailUrl: albumDetailUrl,
-                stationId: songData["stationId"] as? String,
-                songRating: songRating,
-                trackGain: trackGain,
-                audioUrlMap: audioUrlMap
-            )
+        return value
+    }
+
+    private var currentSyncTime: Int64 {
+        syncTime + Int64(Date().timeIntervalSince(syncStart))
+    }
+
+    // MARK: - Stations
+
+    public func stations() async throws -> [Station] {
+        struct Result: Decodable, Sendable { let stations: [Station] }
+        let result: Result = try await authenticated(.getStationList)
+        return result.stations
+    }
+
+    public func playlist(for station: Station) async throws -> [Song] {
+        struct Result: Decodable, Sendable { let items: [Lossy<Song>] }
+        let result: Result = try await authenticated(.getPlaylist, [
+            "stationToken": station.stationToken,
+            "additionalAudioUrl": "HTTP_32_AACPLUS_ADTS,HTTP_64_AACPLUS_ADTS,HTTP_128_MP3",
+        ])
+        // Ads have no trackToken and fail to decode as songs; drop them like Hermes does.
+        return result.items.compactMap(\.value).map { song in
+            var song = song
+            song.stationToken = station.stationToken
+            return song
         }
     }
-    
-    /// Adds feedback for a song.
-    public func addFeedback(songToken: String, rating: Int) async throws {
-        guard let authState else {
-            throw PandoraError.notAuthenticated
-        }
-        
-        let params = [
-            "method": "station.addFeedback",
-            "auth_token": authState.authToken,
-            "user_id": authState.userId,
-            "song_token": songToken,
-            "feedback": rating
-        ]
-        
-        _ = try await makeRequest(params: params)
+
+    public func createStation(musicToken: String) async throws -> Station {
+        try await authenticated(.createStation, ["musicToken": musicToken])
     }
-    
-    /// Deletes feedback for a song.
-    public func deleteFeedback(songToken: String) async throws {
-        guard let authState else {
-            throw PandoraError.notAuthenticated
-        }
-        
-        let params = [
-            "method": "station.deleteFeedback",
-            "auth_token": authState.authToken,
-            "user_id": authState.userId,
-            "song_token": songToken
-        ]
-        
-        _ = try await makeRequest(params: params)
+
+    public func renameStation(_ station: Station, to name: String) async throws {
+        let _: Empty = try await authenticated(.renameStation, [
+            "stationToken": station.stationToken,
+            "stationName": name,
+        ])
     }
-    
-    /// Marks a song as slept.
-    public func sleepSong(songToken: String) async throws {
-        guard let authState else {
-            throw PandoraError.notAuthenticated
-        }
-        
-        let params = [
-            "method": "user.sleepSong",
-            "auth_token": authState.authToken,
-            "user_id": authState.userId,
-            "song_token": songToken
-        ]
-        
-        _ = try await makeRequest(params: params)
+
+    public func deleteStation(_ station: Station) async throws {
+        let _: Empty = try await authenticated(.deleteStation, ["stationToken": station.stationToken])
     }
-    
-    /// Makes a request to the Pandora API.
-    private func makeRequest(params: [String: String]) async throws -> [String: Any] {
-        // Prepare the parameters including time synchronization
-        var finalParams = params
-        
-        if let syncTime {
-            finalParams["sync_time"] = "\(syncTime)"
+
+    public func stationDetail(_ station: Station) async throws -> StationDetail {
+        try await stationDetail(token: station.stationToken)
+    }
+
+    private func stationDetail(token: String) async throws -> StationDetail {
+        try await authenticated(.getStation, [
+            "stationToken": token,
+            "includeExtendedAttributes": true,
+        ])
+    }
+
+    public func genreStations() async throws -> [GenreCategory] {
+        struct Result: Decodable, Sendable { let categories: [GenreCategory] }
+        let result: Result = try await authenticated(.getGenreStations)
+        return result.categories
+    }
+
+    public func search(_ text: String) async throws -> SearchResults {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return SearchResults() }
+        return try await authenticated(.search, ["searchText": text])
+    }
+
+    // MARK: - Seeds & feedback
+
+    @discardableResult
+    public func addSeed(musicToken: String, to station: Station) async throws -> Seed {
+        try await authenticated(.addMusic, [
+            "musicToken": musicToken,
+            "stationToken": station.stationToken,
+        ])
+    }
+
+    public func deleteSeed(_ seed: Seed) async throws {
+        let _: Empty = try await authenticated(.deleteMusic, ["seedId": seed.seedId])
+    }
+
+    public func deleteFeedback(_ feedback: Feedback) async throws {
+        let _: Empty = try await authenticated(.deleteFeedback, ["feedbackId": feedback.feedbackId])
+    }
+
+    // MARK: - Songs
+
+    public func rate(_ song: Song, liked: Bool) async throws {
+        guard let stationToken = song.stationToken else {
+            throw PandoraError.invalidResponse("Song has no station")
         }
-        
-        // Encrypt request body for methods that require it
-        var requestBody = ""
+        let _: Empty = try await authenticated(.addFeedback, [
+            "trackToken": song.trackToken,
+            "isPositive": liked,
+            "stationToken": stationToken,
+        ])
+    }
+
+    /// The API has no "unrate"; find the song's feedback on its station and delete it.
+    public func removeRating(_ song: Song) async throws {
+        guard let stationToken = song.stationToken else { return }
+        let detail = try await stationDetail(token: stationToken)
+        for feedback in detail.likes + detail.dislikes
+        where feedback.songName == song.songName && feedback.artistName == song.artistName {
+            try await deleteFeedback(feedback)
+        }
+    }
+
+    /// "Tired of this song": Pandora won't play it for a month.
+    public func sleep(_ song: Song) async throws {
+        let _: Empty = try await authenticated(.sleepSong, ["trackToken": song.trackToken])
+    }
+
+    // MARK: - Transport
+
+    private func authenticated<T: Decodable & Sendable>(
+        _ method: PandoraMethod, _ parameters: [String: Any] = [:]
+    ) async throws -> T {
+        guard userAuthToken != nil else { throw PandoraError.notAuthenticated }
         do {
-            let encoder = JSONEncoder()
-            let jsonData = try encoder.encode(finalParams)
-            requestBody = String(data: jsonData, encoding: .utf8) ?? ""
-            
-            // Only encrypt the request-body for specific methods
-            if finalParams["method"]?.hasPrefix("auth.") == true || 
-               finalParams["method"]?.hasPrefix("user.") == true ||
-               finalParams["method"]?.hasPrefix("station.") == true {
-                let encrypted = try PandoraCrypto.encrypt(
-                    Data(requestBody.utf8),
-                    key: device.encryptKey
-                )
-                requestBody = encrypted
-            }
-        } catch {
-            throw PandoraError.serializationFailure(error)
+            return try await send(method, body: authenticatedBody(parameters))
+        } catch PandoraError.api(code: PandoraError.Code.invalidAuthToken, _) {
+            // Tokens expire after a few hours; sign in again once and retry.
+            guard let credentials else { throw PandoraError.notAuthenticated }
+            resetSession()
+            try await performLogin(username: credentials.username, password: credentials.password)
+            return try await send(method, body: authenticatedBody(parameters))
         }
-        
-        // Construct URL with device host
-        guard var urlComponents = URLComponents(string: "https://\(device.apiHost)/services/json/") else {
-            throw PandoraError.invalidURL
-        }
-        
-        urlComponents.queryItems = [
-            .init(name: "method", value: params["method"]),
-            .init(name: "partner_id", value: params["partner_id"]),
-            .init(name: "auth_token", value: params["auth_token"]),
-            .init(name: "user_id", value: params["user_id"]),
-            .init(name: "device_id", value: params["device_id"]),
-            .init(name: "version", value: params["version"]),
-        ]
-        
-        // Create request
-        guard let url = urlComponents.url else {
-            throw PandoraError.invalidURL
-        }
-        
-        var request = URLRequest(url: url)
+    }
+
+    private func authenticatedBody(_ parameters: [String: Any]) -> [String: Any] {
+        var body = parameters
+        body["userAuthToken"] = userAuthToken
+        body["syncTime"] = currentSyncTime
+        return body
+    }
+
+    private func send<T: Decodable & Sendable>(_ method: PandoraMethod, body: [String: Any]) async throws -> T {
+        var request = URLRequest(url: url(for: method))
         request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.httpBody = requestBody.data(using: .utf8)
-        
-        // Perform the request and parse response
-        let (data, response) = try await urlSession.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw PandoraError.networkFailure(
-                "HTTP \(httpResponse.statusCode)"
-            )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var payload = try JSONSerialization.data(withJSONObject: body)
+        if method.isEncrypted {
+            payload = Data(try PandoraCrypto.encrypt(payload, key: device.encryptKey).utf8)
         }
-        
-        // Parse JSON response
+        request.httpBody = payload
+
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw PandoraError.http(statusCode: http.statusCode)
+        }
+        return try Self.decodeResult(data)
+    }
+
+    func url(for method: PandoraMethod) -> URL {
+        var query = "method=\(method.rawValue)"
+        if let partnerId { query += "&partner_id=\(Self.escape(partnerId))" }
+        if let token = userAuthToken ?? partnerAuthToken { query += "&auth_token=\(Self.escape(token))" }
+        if let userId { query += "&user_id=\(Self.escape(userId))" }
+        return URL(string: "https://\(device.apiHost)\(PandoraMethod.apiPath)?\(query)")!
+    }
+
+    /// Auth tokens contain `+`, `/` and `=`, which must be escaped in the query.
+    private static func escape(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value
+    }
+
+    static func decodeResult<T: Decodable>(_ data: Data) throws -> T {
+        let decoder = JSONDecoder()
+        let status: ResponseStatus
         do {
-            if let jsonObject = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                // Handle error responses
-                if let status = jsonObject["stat"] as? String, status == "fail" {
-                    if let code = jsonObject["code"] as? Int, let message = jsonObject["message"] as? String {
-                        throw PandoraError.apiFailure(code: code, message: message)
-                    } else {
-                        throw PandoraError.apiFailure(code: 0, message: "API error")
-                    }
-                }
-                
-                return jsonObject
-            } else {
-                throw PandoraError.invalidResponse
-            }
+            status = try decoder.decode(ResponseStatus.self, from: data)
         } catch {
-            throw PandoraError.serializationFailure(error)
+            throw PandoraError.invalidResponse(String(describing: error))
         }
+        guard status.stat == "ok" else {
+            throw PandoraError.api(code: status.code ?? -1, message: status.message ?? "Unknown Pandora error")
+        }
+        do {
+            if let result = try decoder.decode(ResponseEnvelope<T>.self, from: data).result { return result }
+            if let empty = Empty() as? T { return empty }
+            throw PandoraError.invalidResponse("Missing result")
+        } catch let error as PandoraError {
+            throw error
+        } catch {
+            throw PandoraError.invalidResponse(String(describing: error))
+        }
+    }
+}
+
+private struct ResponseStatus: Decodable {
+    let stat: String
+    let code: Int?
+    let message: String?
+}
+
+private struct ResponseEnvelope<T: Decodable>: Decodable {
+    let result: T?
+}
+
+/// For calls whose result we don't use.
+struct Empty: Decodable, Sendable {}
+
+/// Decodes an element if it can, so one odd item (e.g. an ad) doesn't fail the array.
+struct Lossy<Value: Decodable & Sendable>: Decodable, Sendable {
+    let value: Value?
+    init(from decoder: any Decoder) throws {
+        value = try? Value(from: decoder)
     }
 }
