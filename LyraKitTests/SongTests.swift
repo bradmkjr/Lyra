@@ -38,4 +38,20 @@ struct SongTests {
         // A higher bitrate from audioUrlMap wins.
         #expect(song.audioURL(for: .high)?.lastPathComponent == "192")
     }
+
+    @Test func httpURLsAreUpgradedToHTTPS() throws {
+        let json = """
+        {
+          "trackToken": "t3", "songName": "S", "artistName": "A", "albumName": "B",
+          "albumArtUrl": "http://mediaserver-cont-sv7-2-v4v6.pandora.com/images/x/1080W_1080H.jpg",
+          "songDetailUrl": "http://www.pandora.com/song/x",
+          "additionalAudioUrl": ["http://audio.example.com/32"]
+        }
+        """
+        let song = try JSONDecoder().decode(Song.self, from: Data(json.utf8))
+        #expect(song.albumArtUrl?.absoluteString ==
+                "https://mediaserver-cont-sv7-2-v4v6.pandora.com/images/x/1080W_1080H.jpg")
+        #expect(song.songDetailUrl?.scheme == "https")
+        #expect(song.audioURL(for: .low)?.scheme == "https")
+    }
 }

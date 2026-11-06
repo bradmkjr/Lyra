@@ -98,12 +98,12 @@ public struct Song: Sendable, Hashable, Identifiable, Decodable {
             ?? (try? c.decodeIfPresent(String.self, forKey: .additionalAudioUrl)).flatMap { $0.map { [$0] } }
             ?? []
         for (quality, string) in zip([Quality.low, .medium, .high], additional) {
-            urls[quality] = URL(string: string)
+            urls[quality] = URL(secureString: string)
         }
         let map = (try? c.decodeIfPresent([String: AudioURLInfo].self, forKey: .audioUrlMap)) ?? [:]
         let thresholds: [Quality: Int] = [.high: 128, .medium: 64, .low: 32]
         for quality in Quality.allCases {
-            guard let info = map[quality.rawValue], let url = URL(string: info.audioUrl) else { continue }
+            guard let info = map[quality.rawValue], let url = URL(secureString: info.audioUrl) else { continue }
             if urls[quality] == nil || Int(info.bitrate ?? "") ?? 0 > thresholds[quality]! {
                 urls[quality] = url
             }
@@ -116,6 +116,18 @@ extension KeyedDecodingContainer {
     /// Pandora sends `""` for missing URLs, which `URL`'s own decoder rejects.
     func lenientURL(_ key: Key) -> URL? {
         guard let string = try? decodeIfPresent(String.self, forKey: key), !string.isEmpty else { return nil }
-        return URL(string: string)
+        return URL(secureString: string)
+    }
+}
+
+extension URL {
+    /// Pandora still returns `http://` URLs for album art, detail pages and some
+    /// streams. Its hosts all serve the same paths over HTTPS, so upgrade them rather
+    /// than weakening App Transport Security (Hermes set `NSAllowsArbitraryLoads`).
+    init?(secureString string: String) {
+        guard var components = URLComponents(string: string) else { return nil }
+        if components.scheme?.lowercased() == "http" { components.scheme = "https" }
+        guard let url = components.url else { return nil }
+        self = url
     }
 }
