@@ -16,3 +16,24 @@ make verify-arch  # Release build + check every binary is arm64 + x86_64
 ```
 
 Or open `Lyra.xcodeproj` and use the **Lyra** scheme.
+
+## Scripting and integrations
+
+Lyra keeps Hermes's AppleScript dictionary (same command codes), so Hermes scripts work
+after changing the target to `"Lyra"`:
+
+```applescript
+tell application "Lyra"
+  playpause
+  next song
+  thumbs up
+  set playback volume to 60
+  get title of current song
+  set current station to station "Shuffle"
+end tell
+```
+
+When a song starts, Lyra posts a `lyra.song` distributed notification. Because Lyra is
+sandboxed it can't attach `userInfo`, so the notification's `object` is a JSON string
+with Hermes's `hermes.song` keys (`title`, `artist`, `album`, `art`, `stationId`,
+`nrating`, `titleUrl`, `artistUrl`, `albumUrl`, `token`).

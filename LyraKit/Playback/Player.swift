@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import Observation
+import os
 
 /// Plays a Pandora station: fetches playlist fragments, prefetches the next one
 /// when the queue runs low, and keeps a short history (replaces Hermes's
@@ -28,6 +29,13 @@ public final class Player {
 
     public static let historyLimit = 20
 
+    /// Called once a song's audio is ready to play (for notifications and broadcasts).
+    @ObservationIgnored public var onSongStart: (@MainActor (Song) -> Void)?
+    /// Called when paused playback resumes.
+    @ObservationIgnored public var onResume: (@MainActor (Song) -> Void)?
+
+    static let log = Logger(subsystem: "com.velpeo.Lyra", category: "playback")
+
     @ObservationIgnored private let client: PandoraClient
     @ObservationIgnored private let avPlayer = AVPlayer()
     @ObservationIgnored private var queue: [Song] = []
@@ -39,12 +47,19 @@ public final class Player {
     @ObservationIgnored private lazy var nowPlaying = NowPlayingBridge(player: self)
     /// Consecutive songs that failed to start; stops a skip loop when the network is down.
     @ObservationIgnored private var consecutiveFailures = 0
+    /// The song being loaded; failures for any other song are stale and ignored.
+    @ObservationIgnored private var pendingTrackToken: String?
+    /// Streams of the pending song not tried yet.
+    @ObservationIgnored private var remainingStreams: [Song.AudioStream] = []
+    @ObservationIgnored private var announcedTrackToken: String?
 
     public init(client: PandoraClient) {
         self.client = client
         avPlayer.automaticallyWaitsToMinimizeStalling = true
 
-        statusObservation = avPlayer.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] _, _ in
+        // KVO can fire on any thread; @Sendable keeps these handlers from being main-actor
+        // isolated (Swift 6 traps if an isolated closure runs elsewhere). They hop back via Task.
+        statusObservation = avPlayer.observe(\.timeControlStatus, options: [.initial, .new]) { @Sendable [weak self] _, _ in
             Task { @MainActor in self?.syncPlaybackState() }
         }
         timeObserver = avPlayer.addPeriodicTimeObserver(
@@ -82,11 +97,13 @@ public final class Player {
     }
 
     public func resume() {
-        guard currentSong != nil else {
+        guard let song = currentSong else {
             if station != nil { Task { await advance() } }
             return
         }
+        let wasPaused = avPlayer.timeControlStatus == .paused
         avPlayer.play()
+        if wasPaused { onResume?(song) }
     }
 
     public func pause() {
@@ -199,44 +216,78 @@ public final class Player {
     }
 
     private func start(_ song: Song) {
-        guard let url = song.audioURL(for: quality) else {
-            failed(song)
-            return
-        }
         currentSong = song
         elapsed = 0
         duration = 0
         history.removeAll { $0.trackToken == song.trackToken }
         history.insert(song, at: 0)
         if history.count > Self.historyLimit { history.removeLast(history.count - Self.historyLimit) }
+        pendingTrackToken = song.trackToken
+        remainingStreams = song.audioCandidates(preferring: quality)
+        nowPlaying.update()
+        loadNextStream(for: song, lastError: "No audio URL")
+    }
 
-        let item = AVPlayerItem(url: url)
-        itemObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-            guard item.status == .failed else {
-                if item.status == .readyToPlay { Task { @MainActor in self?.consecutiveFailures = 0 } }
-                return
+    /// Tries the song's next stream; once all have failed, gives up on the song.
+    private func loadNextStream(for song: Song, lastError: String) {
+        guard pendingTrackToken == song.trackToken else { return }
+        guard !remainingStreams.isEmpty else {
+            failed(song, reason: lastError)
+            return
+        }
+        let stream = remainingStreams.removeFirst()
+        Self.log.info("Loading \(song.songName, privacy: .public) as \(stream.format.rawValue, privacy: .public) from \(stream.url.host() ?? "?", privacy: .public)")
+
+        // Pandora's URLs have no extension; tell AVFoundation what format to expect.
+        let asset = AVURLAsset(url: stream.url, options: [AVURLAssetOverrideMIMETypeKey: stream.format.mimeType])
+        let item = AVPlayerItem(asset: asset)
+        itemObservation = item.observe(\.status, options: [.new]) { @Sendable [weak self] item, _ in
+            let status = item.status
+            let reason = item.errorLog()?.events.last?.errorComment
+                ?? item.error?.localizedDescription
+                ?? "Unknown error"
+            Task { @MainActor in
+                self?.itemStatusChanged(status, reason: reason, stream: stream, song: song)
             }
-            Task { @MainActor in self?.failed(song) }
         }
         avPlayer.replaceCurrentItem(with: item)
         avPlayer.volume = volume
         avPlayer.play()
-        nowPlaying.update()
     }
 
-    /// Pandora stream URLs expire after a while; skip songs that won't load.
-    private func failed(_ song: Song) {
-        guard song.trackToken == currentSong?.trackToken || currentSong == nil else { return }
+    private func itemStatusChanged(_ status: AVPlayerItem.Status, reason: String,
+                                   stream: Song.AudioStream, song: Song) {
+        guard pendingTrackToken == song.trackToken else { return }
+        switch status {
+        case .readyToPlay:
+            consecutiveFailures = 0
+            if announcedTrackToken != song.trackToken {
+                announcedTrackToken = song.trackToken
+                onSongStart?(song)
+            }
+        case .failed:
+            Self.log.error("Stream failed (\(stream.format.rawValue, privacy: .public), \(stream.url.host() ?? "?", privacy: .public)): \(reason, privacy: .public)")
+            loadNextStream(for: song, lastError: reason)
+        default:
+            break
+        }
+    }
+
+    /// No stream of `song` would play. Pandora stream URLs expire after a while, so
+    /// drop the queued fragment and fetch a fresh one.
+    private func failed(_ song: Song, reason: String) {
+        guard pendingTrackToken == song.trackToken else { return }
+        pendingTrackToken = nil
+        history.removeAll { $0.trackToken == song.trackToken }
         consecutiveFailures += 1
+        Self.log.error("Skipping \(song.songName, privacy: .public): \(reason, privacy: .public)")
+        queue = []
         if consecutiveFailures >= 3 {
             consecutiveFailures = 0
-            lastError = "Couldn't load audio from Pandora. Check your connection."
-            queue = []
+            lastError = "Couldn't play audio from Pandora: \(reason)"
             stopPlayback()
             return
         }
-        // Expired URLs usually mean the whole queued fragment is stale.
-        queue = []
         next()
     }
 
@@ -244,6 +295,8 @@ public final class Player {
         avPlayer.pause()
         avPlayer.replaceCurrentItem(with: nil)
         itemObservation = nil
+        pendingTrackToken = nil
+        remainingStreams = []
         currentSong = nil
         elapsed = 0
         duration = 0

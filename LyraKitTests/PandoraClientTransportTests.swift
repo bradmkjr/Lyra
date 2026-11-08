@@ -66,6 +66,8 @@ struct PandoraClientTransportTests {
         #expect(songs.map(\.songName) == ["Reckoner"])
         #expect(songs[0].stationToken == "tok2")
         #expect(songs[0].audioURL(for: .medium)?.lastPathComponent == "64")
+        #expect(songs[0].audioStream(for: .medium)?.format == .aacADTS)
+        #expect(songs[0].audioStream(for: .high)?.format == .mp3)
         #expect(server.requests.last?.body["stationToken"] as? String == "tok2")
     }
 

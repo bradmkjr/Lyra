@@ -8,6 +8,8 @@ struct SettingsView: View {
                 .tabItem { Label("Account", systemImage: "person.crop.circle") }
             PlaybackSettings()
                 .tabItem { Label("Playback", systemImage: "play.circle") }
+            NotificationSettings()
+                .tabItem { Label("Notifications", systemImage: "bell") }
             GeneralSettings()
                 .tabItem { Label("General", systemImage: "gearshape") }
         }
@@ -46,6 +48,21 @@ private struct PlaybackSettings: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Toggle("Play last station on launch", isOn: $autoPlay)
+        }
+    }
+}
+
+private struct NotificationSettings: View {
+    @AppStorage(DefaultsKey.notifyNewSong) private var notifyNewSong = true
+    @AppStorage(DefaultsKey.notifyResume) private var notifyResume = false
+
+    var body: some View {
+        Form {
+            Toggle("Notify when a new song starts", isOn: $notifyNewSong)
+            Toggle("Notify when playback resumes", isOn: $notifyResume)
+            Text("Notifications show while Lyra is in the background and include Like, Dislike and Skip.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 }

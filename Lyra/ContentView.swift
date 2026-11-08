@@ -87,5 +87,5 @@ struct MainView: View {
 
 #Preview {
     ContentView()
-        .environment(AppModel())
+        .environment(AppModel.shared)
 }

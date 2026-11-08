@@ -23,12 +23,17 @@ enum DefaultsKey {
     static let stationSort = "stationSort"
     static let showInDock = "showInDock"
     static let autoPlay = "autoPlayLastStation"
+    static let notifyNewSong = "notifyOnNewSong"
+    static let notifyResume = "notifyOnResume"
 }
 
 /// App-wide state: the Pandora session, the station list and the player.
 @MainActor
 @Observable
 final class AppModel {
+    /// Shared by SwiftUI and the AppleScript commands (AppleScriptSupport.swift).
+    static let shared = AppModel()
+
     enum SessionState: Equatable {
         case signedOut
         case signingIn
@@ -48,19 +53,35 @@ final class AppModel {
     let client: PandoraClient
     let player: Player
     @ObservationIgnored private let defaults = UserDefaults.standard
+    @ObservationIgnored private var volumeBeforeMute: Float?
 
-    init() {
+    private init() {
         defaults.register(defaults: [
             DefaultsKey.audioQuality: Song.Quality.medium.rawValue,
             DefaultsKey.volume: 1.0,
             DefaultsKey.showInDock: true,
             DefaultsKey.autoPlay: true,
+            DefaultsKey.notifyNewSong: true,
+            DefaultsKey.notifyResume: false,
         ])
         client = PandoraClient()
         player = Player(client: client)
         player.volume = defaults.float(forKey: DefaultsKey.volume)
         player.quality = Song.Quality(rawValue: defaults.string(forKey: DefaultsKey.audioQuality) ?? "") ?? .medium
         stationSort = StationSort(rawValue: defaults.string(forKey: DefaultsKey.stationSort) ?? "") ?? .nameAscending
+
+        player.onSongStart = { [weak self] song in self?.songStarted(song) }
+        player.onResume = { [weak self] song in
+            guard let self, defaults.bool(forKey: DefaultsKey.notifyResume) else { return }
+            Task { await NotificationService.shared.notify(song, resumed: true) }
+        }
+    }
+
+    private func songStarted(_ song: Song) {
+        NotificationService.shared.broadcast(song)
+        if defaults.bool(forKey: DefaultsKey.notifyNewSong) {
+            Task { await NotificationService.shared.notify(song) }
+        }
     }
 
     var isSignedIn: Bool {
@@ -194,6 +215,18 @@ final class AppModel {
     func setVolume(_ volume: Float) {
         player.volume = volume
         defaults.set(volume, forKey: DefaultsKey.volume)
+        if volume > 0 { volumeBeforeMute = nil }
+    }
+
+    func mute() {
+        guard player.volume > 0 else { return }
+        let previous = player.volume
+        setVolume(0)
+        volumeBeforeMute = previous
+    }
+
+    func unmute() {
+        setVolume(volumeBeforeMute ?? 1)
     }
 
     func setQuality(_ quality: Song.Quality) {

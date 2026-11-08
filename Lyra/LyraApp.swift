@@ -1,11 +1,12 @@
 import AppKit
 import LyraKit
 import SwiftUI
+import UserNotifications
 
 @main
 struct LyraApp: App {
     @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
-    @State private var model = AppModel()
+    @State private var model = AppModel.shared
 
     var body: some Scene {
         Window("Lyra", id: "main") {
@@ -31,10 +32,42 @@ struct LyraApp: App {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: [DefaultsKey.showInDock: true])
         Self.applyDockPreference()
+        UNUserNotificationCenter.current().delegate = self
+        NotificationService.shared.registerCategories()
+    }
+
+    // MARK: Notifications
+
+    /// Song banners are for when Lyra is in the background.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        await MainActor.run { NSApp.isActive ? [] : [.banner, .list] }
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            didReceive response: UNNotificationResponse) async {
+        let action = response.actionIdentifier
+        let token = response.notification.request.content.userInfo["trackToken"] as? String
+        await MainActor.run { Self.handle(action: action, trackToken: token) }
+    }
+
+    private static func handle(action: String, trackToken: String?) {
+        let player = AppModel.shared.player
+        let song = player.history.first { $0.trackToken == trackToken }
+        switch NotificationService.Action(rawValue: action) {
+        case .like:
+            if let song, !song.isLiked { Task { await player.toggleLike(song) } }
+        case .dislike:
+            if let song { Task { await player.dislike(song) } }
+        case .skip:
+            if player.currentSong?.trackToken == trackToken { player.next() }
+        case nil:
+            NSApp.activate()
+        }
     }
 
     /// Keep playing from the menu bar after the window closes, like Hermes.

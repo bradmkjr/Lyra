@@ -31,7 +31,7 @@ Lyra.xcodeproj
 │   ├── Pandora/    JSON API v5 client, partner devices, Blowfish crypto
 │   ├── Models/     Station, Song, SearchResult, Feedback
 │   ├── Playback/   AVPlayer-based player + playlist prefetch
-│   └── Services/   Keychain, Last.fm scrobbler, reachability
+│   └── Services/   Keychain, notifications
 ├── LyraKitTests    (unit tests, Swift Testing)
 └── LyraUITests     (UI smoke tests, XCTest)
 ```
@@ -69,10 +69,16 @@ Build settings shared by all targets:
 - Tests with a `URLProtocol` stub replaying recorded JSON.
 
 ### Phase 2 — Playback ✅
-- `Player` (`@Observable`) on `AVQueuePlayer`: prefetch next playlist when
+- `Player` (`@Observable`) on `AVPlayer` with its own queue: prefetch next playlist when
   the queue runs low, skip, pause/resume, volume, progress, audio quality pref
   (low/medium/high per Hermes).
-- Handle expired track URLs (Pandora links time out) by refetching.
+- Audio URLs stay on HTTP: the `audio-*.pandora.com` stream hosts don't serve HTTPS, so
+  `Lyra-Info.plist` sets `NSAllowsArbitraryLoadsForMedia` (AVFoundation only; API calls and
+  artwork stay HTTPS). Streams have no file extension, so each carries its format and
+  `AVURLAssetOverrideMIMETypeKey` tells AVFoundation `audio/aac` (ADTS) or `audio/mpeg`.
+- A song that won't load tries its other streams before being skipped; skipping drops the
+  queued fragment (Pandora links expire) and refetches. Failures log to
+  `log stream --predicate 'subsystem == "com.velpeo.Lyra"'`.
 - `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` (replaces SPMediaKeyTap).
 
 ### Phase 3 — UI parity ✅
@@ -83,25 +89,28 @@ Build settings shared by all targets:
   edit seeds & feedback (`station.getStation`, `addMusic`, `deleteMusic`, …).
 - Menu bar extra with play/pause/skip and optional "menu bar only" mode
   (Hermes's `LSUIElement` toggle → `NSApp.setActivationPolicy`).
-- Settings window: account, playback, notifications, Last.fm, proxy.
+- Settings window: account, playback, notifications, general.
 - Keyboard shortcuts per `Hermes/Documentation/KeyboardShortcuts.md`.
 
-### Phase 4 — Integrations
+### Phase 4 — Integrations ✅ (except Last.fm)
 - Notifications via `UserNotifications` (new song / resume, with album art and
-  like/skip actions).
-- Distributed notification `hermes.song`-compatible (`lyra.song`) for 3rd-party tools.
-- AppleScript: port `Hermes.sdef` command set (play, pause, playpause, next song,
-  thumbs up/down, tired of song, volume commands, current station/song properties).
-- Last.fm scrobbling (`auth.getSession`, `track.scrobble`, `track.love`).
+  Like/Dislike/Skip actions).
+- Distributed notification `lyra.song` with Hermes's `hermes.song` keys. Sandboxed apps
+  can't send `userInfo`, so the payload is a JSON string in the notification's `object`.
+- AppleScript: `Lyra/Lyra.sdef` ports `Hermes.sdef` with the same four-char codes (play,
+  pause, playpause, next song, thumbs up/down, tired of song, volume commands, current
+  station/song properties).
+- Deferred: Last.fm scrobbling (`auth.getMobileSession`, `track.scrobble`, `track.love`);
+  needs a Last.fm API key and secret.
 
 ### Phase 5 — Distribution
 - Sparkle 2 via SPM, EdDSA-signed appcast.
-- Developer ID signing + notarization script (replaces `Scripts/*.sh`).
+- Developer ID signing + notarization script.
 - `lipo -archs` check in CI to guarantee `arm64 x86_64`.
 
-### Known gaps after Phase 3
-- Not yet verified against the live Pandora service (needs a real account); the wire
-  format is covered by `PandoraClientTransportTests` against a fake tuner.
+### Known gaps
+- Playback fixes (HTTP media, format hints) still need confirming against a live account;
+  the wire format is covered by `PandoraClientTransportTests` against a fake tuner.
 - Proxy settings and an explicit "toolbar hide" toggle from Hermes are not ported.
 
 ## Open questions

@@ -19,7 +19,8 @@ final class NowPlayingBridge {
         let center = MPRemoteCommandCenter.shared()
         func handle(_ command: MPRemoteCommand, _ action: @escaping @MainActor (Player) -> Void) {
             command.isEnabled = true
-            command.addTarget { [weak self] _ in
+            // @Sendable: MediaPlayer may call this off the main thread (see makeArtwork).
+            command.addTarget { @Sendable [weak self] _ in
                 Task { @MainActor in
                     if let player = self?.player { action(player) }
                 }
@@ -72,8 +73,15 @@ final class NowPlayingBridge {
         artworkTask = Task {
             guard let (data, _) = try? await URLSession.shared.data(from: url),
                   let image = NSImage(data: data), !Task.isCancelled else { return }
-            artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            artwork = Self.makeArtwork(image)
             update()
         }
+    }
+
+    /// MediaPlayer calls the request handler on its own queue. A closure written inside this
+    /// main-actor class would be main-actor isolated, and Swift 6 traps when it runs elsewhere,
+    /// so build it in a nonisolated context.
+    private nonisolated static func makeArtwork(_ image: NSImage) -> MPMediaItemArtwork {
+        MPMediaItemArtwork(boundsSize: image.size) { @Sendable _ in image }
     }
 }

@@ -16,7 +16,7 @@ public struct Song: Sendable, Hashable, Identifiable, Decodable {
     /// 1 = liked, -1 = disliked (local only), 0 = unrated.
     public var songRating: Int
     public var trackGain: String?
-    public var audioURLs: [Quality: URL]
+    public var audioStreams: [Quality: AudioStream]
 
     /// Keys of `audioUrlMap`, matching Hermes's audio-quality preference.
     public enum Quality: String, Sendable, CaseIterable, Hashable {
@@ -33,9 +33,34 @@ public struct Song: Sendable, Hashable, Identifiable, Decodable {
         }
     }
 
+    /// One way to stream the song. Pandora's URLs have no file extension, so the
+    /// format is kept alongside to tell AVFoundation what it's getting.
+    public struct AudioStream: Sendable, Hashable {
+        public let url: URL
+        public let format: AudioFormat
+
+        public init(url: URL, format: AudioFormat) {
+            self.url = url
+            self.format = format
+        }
+    }
+
+    public enum AudioFormat: String, Sendable, Hashable {
+        /// Raw AAC+ in ADTS frames (Pandora's `aacplus`), served as `audio/aacp`.
+        case aacADTS
+        case mp3
+
+        public var mimeType: String {
+            switch self {
+            case .aacADTS: "audio/aac"
+            case .mp3: "audio/mpeg"
+            }
+        }
+    }
+
     public init(trackToken: String, songName: String, artistName: String, albumName: String,
                 albumArtUrl: URL? = nil, stationId: String? = nil, stationToken: String? = nil,
-                songRating: Int = 0, audioURLs: [Quality: URL] = [:]) {
+                songRating: Int = 0, audioStreams: [Quality: AudioStream] = [:]) {
         self.trackToken = trackToken
         self.songName = songName
         self.artistName = artistName
@@ -44,21 +69,36 @@ public struct Song: Sendable, Hashable, Identifiable, Decodable {
         self.stationId = stationId
         self.stationToken = stationToken
         self.songRating = songRating
-        self.audioURLs = audioURLs
+        self.audioStreams = audioStreams
     }
 
     /// Falls back the way Hermes does: missing medium uses low, missing high uses medium,
     /// and anything still missing uses whatever exists.
-    public func audioURL(for quality: Quality) -> URL? {
-        let low = audioURLs[.low]
-        let medium = audioURLs[.medium] ?? low
-        let high = audioURLs[.high] ?? medium
+    public func audioStream(for quality: Quality) -> AudioStream? {
+        let low = audioStreams[.low]
+        let medium = audioStreams[.medium] ?? low
+        let high = audioStreams[.high] ?? medium
         let chosen = switch quality {
         case .low: low
         case .medium: medium
         case .high: high
         }
         return chosen ?? high ?? medium ?? low
+    }
+
+    public func audioURL(for quality: Quality) -> URL? {
+        audioStream(for: quality)?.url
+    }
+
+    /// Streams to try in order when one fails to load: the preferred quality, then any MP3
+    /// (the most widely decodable), then everything else from best to worst, without repeats.
+    public func audioCandidates(preferring quality: Quality) -> [AudioStream] {
+        let byQuality = [Quality.high, .medium, .low].compactMap { audioStreams[$0] }
+        let ordered = [audioStream(for: quality)].compactMap { $0 }
+            + byQuality.filter { $0.format == .mp3 }
+            + byQuality
+        var seen = Set<URL>()
+        return ordered.filter { seen.insert($0.url).inserted }
     }
 
     public var isLiked: Bool { songRating > 0 }
@@ -75,6 +115,7 @@ public struct Song: Sendable, Hashable, Identifiable, Decodable {
     private struct AudioURLInfo: Decodable {
         let audioUrl: String
         let bitrate: String?
+        let encoding: String?
     }
 
     public init(from decoder: any Decoder) throws {
@@ -93,22 +134,26 @@ public struct Song: Sendable, Hashable, Identifiable, Decodable {
 
         // `additionalAudioUrl` is requested as 32k AAC+, 64k AAC+, 128k MP3 (see
         // PandoraClient.playlist); `audioUrlMap` overrides it when it offers a better bitrate.
-        var urls: [Quality: URL] = [:]
+        // Audio URLs keep their scheme: the audio-*.pandora.com hosts don't serve HTTPS, so
+        // they load over HTTP via NSAllowsArbitraryLoadsForMedia in Lyra-Info.plist.
+        var streams: [Quality: AudioStream] = [:]
         let additional = (try? c.decodeIfPresent([String].self, forKey: .additionalAudioUrl))
             ?? (try? c.decodeIfPresent(String.self, forKey: .additionalAudioUrl)).flatMap { $0.map { [$0] } }
             ?? []
-        for (quality, string) in zip([Quality.low, .medium, .high], additional) {
-            urls[quality] = URL(secureString: string)
+        let requestedFormats: [(Quality, AudioFormat)] = [(.low, .aacADTS), (.medium, .aacADTS), (.high, .mp3)]
+        for ((quality, format), string) in zip(requestedFormats, additional) {
+            if let url = URL(string: string) { streams[quality] = AudioStream(url: url, format: format) }
         }
         let map = (try? c.decodeIfPresent([String: AudioURLInfo].self, forKey: .audioUrlMap)) ?? [:]
         let thresholds: [Quality: Int] = [.high: 128, .medium: 64, .low: 32]
         for quality in Quality.allCases {
-            guard let info = map[quality.rawValue], let url = URL(secureString: info.audioUrl) else { continue }
-            if urls[quality] == nil || Int(info.bitrate ?? "") ?? 0 > thresholds[quality]! {
-                urls[quality] = url
+            guard let info = map[quality.rawValue], let url = URL(string: info.audioUrl) else { continue }
+            if streams[quality] == nil || Int(info.bitrate ?? "") ?? 0 > thresholds[quality]! {
+                let format: AudioFormat = info.encoding?.lowercased().contains("mp3") == true ? .mp3 : .aacADTS
+                streams[quality] = AudioStream(url: url, format: format)
             }
         }
-        audioURLs = urls
+        audioStreams = streams
     }
 }
 
@@ -121,9 +166,9 @@ extension KeyedDecodingContainer {
 }
 
 extension URL {
-    /// Pandora still returns `http://` URLs for album art, detail pages and some
-    /// streams. Its hosts all serve the same paths over HTTPS, so upgrade them rather
-    /// than weakening App Transport Security (Hermes set `NSAllowsArbitraryLoads`).
+    /// Pandora still returns `http://` URLs for album art and detail pages. Those hosts
+    /// serve the same paths over HTTPS, so upgrade them rather than weakening App Transport
+    /// Security (Hermes set `NSAllowsArbitraryLoads`). Not for audio: see `Song.init(from:)`.
     init?(secureString string: String) {
         guard var components = URLComponents(string: string) else { return nil }
         if components.scheme?.lowercased() == "http" { components.scheme = "https" }
