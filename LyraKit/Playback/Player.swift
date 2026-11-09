@@ -27,7 +27,23 @@ public final class Player {
     /// Applies from the next song on.
     public var quality: Song.Quality = .medium
 
+    /// Core Audio device to play through (see `OutputRouter`); nil is the system default.
+    /// Takes effect immediately, mid-song.
+    public var outputDeviceUID: String? {
+        didSet { avPlayer.audioOutputDeviceUniqueID = outputDeviceUID }
+    }
+
     public static let historyLimit = 20
+
+    /// Where captured audio goes (the AirPlay rooms); nil stops capturing.
+    public func setAirPlaySink(_ sink: (@Sendable ([Int16], UInt64) -> Void)?) {
+        tap.setSink(sink)
+    }
+
+    /// Holds this Mac's own output back by `seconds`, so it plays with the AirPlay rooms.
+    public func setLocalDelay(_ seconds: TimeInterval) {
+        tap.setLocalDelay(seconds)
+    }
 
     /// Called once a song's audio is ready to play (for notifications and broadcasts).
     @ObservationIgnored public var onSongStart: (@MainActor (Song) -> Void)?
@@ -45,6 +61,7 @@ public final class Player {
     @ObservationIgnored private var timeObserver: Any?
     @ObservationIgnored private var endObserver: NSObjectProtocol?
     @ObservationIgnored private lazy var nowPlaying = NowPlayingBridge(player: self)
+    @ObservationIgnored private let tap = PCMTap()
     /// Consecutive songs that failed to start; stops a skip loop when the network is down.
     @ObservationIgnored private var consecutiveFailures = 0
     /// The song being loaded; failures for any other song are stale and ignored.
@@ -56,6 +73,11 @@ public final class Player {
     public init(client: PandoraClient) {
         self.client = client
         avPlayer.automaticallyWaitsToMinimizeStalling = true
+        // Never hand Pandora's stream URL to an AirPlay receiver: an Apple TV fetching it
+        // itself can't decode the extension-less raw AAC and fails within a second. AirPlay
+        // rooms are reached as Core Audio outputs instead (see OutputRouter), so this Mac
+        // decodes and the receiver gets plain audio.
+        avPlayer.allowsExternalPlayback = false
 
         // KVO can fire on any thread; @Sendable keeps these handlers from being main-actor
         // isolated (Swift 6 traps if an isolated closure runs elsewhere). They hop back via Task.
@@ -241,6 +263,7 @@ public final class Player {
         // Pandora's URLs have no extension; tell AVFoundation what format to expect.
         let asset = AVURLAsset(url: stream.url, options: [AVURLAssetOverrideMIMETypeKey: stream.format.mimeType])
         let item = AVPlayerItem(asset: asset)
+        tap.attach(to: item)
         itemObservation = item.observe(\.status, options: [.new]) { @Sendable [weak self] item, _ in
             let status = item.status
             let reason = item.errorLog()?.events.last?.errorComment

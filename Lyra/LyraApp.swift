@@ -162,6 +162,15 @@ struct MenuBarContent: View {
             Divider()
         }
         PlaybackMenuItems(player: model.player)
+        Menu("Speakers") {
+            Toggle("System Output", isOn: Binding(get: { model.isUsingSystemOutput },
+                                                  set: { if $0 { model.useSystemOutput() } }))
+            Divider()
+            ForEach(model.outputs) { device in
+                Toggle(device.name, isOn: Binding(get: { model.selectedOutputIDs.contains(device.id) },
+                                                  set: { _ in model.toggleOutput(device) }))
+            }
+        }
         if model.isSignedIn, !model.stations.isEmpty {
             Divider()
             Menu("Stations") {

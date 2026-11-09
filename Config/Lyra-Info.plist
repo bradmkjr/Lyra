@@ -10,6 +10,15 @@
 	<string>Lyra.sdef</string>
 	<!-- Pandora's audio-*.pandora.com stream hosts are HTTP-only. Allow plain HTTP for
 	     AVFoundation media loads only; URLSession (API, artwork) stays HTTPS-only. -->
+	<!-- Lyra finds AirPlay receivers on the local network and streams to them itself. -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_raop._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Lyra finds AirPlay speakers and Apple TVs on your network so it can play music in other rooms.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Lyra listens for short chirps from each room's speakers to line up multi-room playback. Audio is only analyzed during calibration and never saved.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoadsForMedia</key>

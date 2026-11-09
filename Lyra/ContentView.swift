@@ -45,6 +45,8 @@ struct MainView: View {
     @Environment(AppModel.self) private var model
     @State private var sheet: StationSheet?
     @State private var showsHistory = false
+    /// The right-hand Speakers sidebar; remembered between launches.
+    @AppStorage("showsSpeakersSidebar") private var showsOutputs = false
 
     var body: some View {
         NavigationSplitView {
@@ -61,7 +63,21 @@ struct MainView: View {
                         .transition(.move(edge: .trailing))
                 }
             }
+            .inspector(isPresented: $showsOutputs) {
+                ScrollView {
+                    OutputsView()
+                }
+                .inspectorColumnWidth(min: 300, ideal: 360, max: 480)
+            }
             .toolbar {
+                ToolbarItem {
+                    Toggle(isOn: $showsOutputs) {
+                        Label("Speakers", systemImage: model.activeOutputs.count > 1 || !model.selectedAirPlayIDs.isEmpty
+                              ? "hifispeaker.2.fill" : "hifispeaker.2")
+                    }
+                    .keyboardShortcut("k", modifiers: [.command, .option])
+                    .help("Show speakers and AirPlay rooms (⌥⌘K)")
+                }
                 ToolbarItem {
                     Toggle(isOn: $showsHistory.animation()) {
                         Label("History", systemImage: "clock.arrow.circlepath")

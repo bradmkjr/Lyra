@@ -6,5 +6,11 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!-- AirPlay receivers send timing and resend requests back to Lyra over UDP. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<!-- Room calibration listens for its chirps with the microphone. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
 </dict>
 </plist>

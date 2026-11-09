@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import LyraKit
 import Observation
@@ -25,6 +26,21 @@ enum DefaultsKey {
     static let autoPlay = "autoPlayLastStation"
     static let notifyNewSong = "notifyOnNewSong"
     static let notifyResume = "notifyOnResume"
+    static let outputDeviceUIDs = "outputDeviceUIDs"
+    static let airPlayRooms = "airPlayRooms"
+    static let selectedAirPlayRooms = "selectedAirPlayRooms"
+}
+
+/// A receiver's saved settings and live state.
+struct AirPlayRoomSettings: Codable, Equatable {
+    var volume: Double = 0.7
+    /// Seconds later (+) or earlier (−) than the other rooms.
+    var delay: Double = 0
+}
+
+enum AirPlayRoomStatus: Equatable {
+    case idle, connecting, playing
+    case failed(String)
 }
 
 /// App-wide state: the Pandora session, the station list and the player.
@@ -55,6 +71,32 @@ final class AppModel {
     @ObservationIgnored private let defaults = UserDefaults.standard
     @ObservationIgnored private var volumeBeforeMute: Float?
 
+    /// Local outputs (Core Audio devices) and which of them Lyra plays through together.
+    /// Empty selection means the system default output.
+    private(set) var outputs: [AudioOutputDevice] = []
+    private(set) var selectedOutputIDs: Set<String> = []
+    @ObservationIgnored private let router = OutputRouter()
+    @ObservationIgnored private var outputMonitor: OutputDeviceMonitor?
+    /// What the router last built, so device-list changes (including the aggregate Lyra
+    /// itself creates) don't trigger a rebuild loop.
+    @ObservationIgnored private var routedOutputIDs: [String]?
+
+    /// AirPlay receivers on the network (Lyra's own sender, not macOS's single route).
+    private(set) var airPlayReceivers: [AirPlayReceiver] = []
+    private(set) var airPlayRooms: [String: AirPlayRoomSettings] = [:]
+    private(set) var airPlayStatus: [String: AirPlayRoomStatus] = [:]
+    /// The last calibration outcome per room, shown under its sliders.
+    private(set) var calibrationMessage: [String: String] = [:]
+    private(set) var calibratingID: String?
+
+    /// Calibration needs a microphone: the MacBook Air has one, the Mac mini doesn't.
+    var canCalibrate: Bool { AVCaptureDevice.default(for: .audio) != nil }
+
+    /// Rooms Lyra plays to. Kept across launches; a room reconnects when it's found again.
+    private(set) var selectedAirPlayIDs: Set<String> = []
+    @ObservationIgnored let streamer = AirPlayStreamer()
+    @ObservationIgnored private var airPlayBrowser: AirPlayBrowser?
+
     private init() {
         defaults.register(defaults: [
             DefaultsKey.audioQuality: Song.Quality.medium.rawValue,
@@ -69,6 +111,17 @@ final class AppModel {
         player.volume = defaults.float(forKey: DefaultsKey.volume)
         player.quality = Song.Quality(rawValue: defaults.string(forKey: DefaultsKey.audioQuality) ?? "") ?? .medium
         stationSort = StationSort(rawValue: defaults.string(forKey: DefaultsKey.stationSort) ?? "") ?? .nameAscending
+
+        selectedOutputIDs = Set(defaults.stringArray(forKey: DefaultsKey.outputDeviceUIDs) ?? [])
+        refreshOutputs()
+        outputMonitor = OutputDeviceMonitor { [weak self] in self?.refreshOutputs() }
+        if let data = defaults.data(forKey: DefaultsKey.airPlayRooms),
+           let rooms = try? JSONDecoder().decode([String: AirPlayRoomSettings].self, from: data) {
+            airPlayRooms = rooms
+        }
+        selectedAirPlayIDs = Set(defaults.stringArray(forKey: DefaultsKey.selectedAirPlayRooms) ?? [])
+        airPlayBrowser = AirPlayBrowser { [weak self] receivers in self?.airPlayReceiversChanged(receivers) }
+        airPlayBrowser?.start()
 
         player.onSongStart = { [weak self] song in self?.songStarted(song) }
         player.onResume = { [weak self] song in
@@ -232,6 +285,192 @@ final class AppModel {
     func setQuality(_ quality: Song.Quality) {
         player.quality = quality
         defaults.set(quality.rawValue, forKey: DefaultsKey.audioQuality)
+    }
+
+    // MARK: - Outputs
+
+    var isUsingSystemOutput: Bool { activeOutputs.isEmpty }
+
+    /// Selected outputs that are currently connected.
+    var activeOutputs: [AudioOutputDevice] {
+        outputs.filter { selectedOutputIDs.contains($0.id) }
+    }
+
+    /// Adds or removes an output. Aggregates play alone, since they can't be nested.
+    func toggleOutput(_ device: AudioOutputDevice) {
+        var selection = selectedOutputIDs
+        if selection.contains(device.id) {
+            selection.remove(device.id)
+        } else if device.canJoinGroup {
+            let aggregates = Set(outputs.filter { !$0.canJoinGroup }.map(\.id))
+            selection.subtract(aggregates)
+            selection.insert(device.id)
+        } else {
+            selection = [device.id]
+        }
+        setOutputs(selection)
+    }
+
+    func useSystemOutput() {
+        setOutputs([])
+    }
+
+    private func setOutputs(_ selection: Set<String>) {
+        selectedOutputIDs = selection
+        defaults.set(Array(selection).sorted(), forKey: DefaultsKey.outputDeviceUIDs)
+        applyOutputs()
+    }
+
+    private func refreshOutputs() {
+        outputs = AudioOutputDevice.outputDevices()
+        applyOutputs()
+    }
+
+    /// Points the player at the selected outputs. Disconnected outputs stay selected and
+    /// rejoin when plugged back in.
+    private func applyOutputs() {
+        let chosen = activeOutputs
+        let ids = chosen.map(\.id)
+        guard ids != routedOutputIDs else { return }
+        routedOutputIDs = ids
+        player.outputDeviceUID = nil
+        do {
+            player.outputDeviceUID = try router.route(to: chosen)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - AirPlay rooms
+
+    /// Ticks or unticks a room; ticking connects it, unticking disconnects it.
+    func toggleAirPlayRoom(_ receiver: AirPlayReceiver) {
+        if selectedAirPlayIDs.contains(receiver.id) {
+            selectedAirPlayIDs.remove(receiver.id)
+            airPlayStatus[receiver.id] = .idle
+            updateAirPlayRouting()
+            Task { await streamer.disconnect(receiver.id) }
+        } else {
+            selectedAirPlayIDs.insert(receiver.id)
+            Task { await connectRoom(receiver) }
+        }
+        defaults.set(Array(selectedAirPlayIDs).sorted(), forKey: DefaultsKey.selectedAirPlayRooms)
+    }
+
+    private func airPlayReceiversChanged(_ receivers: [AirPlayReceiver]) {
+        airPlayReceivers = receivers
+        // Reconnect selected rooms as they appear on the network.
+        for receiver in receivers where selectedAirPlayIDs.contains(receiver.id)
+            && (airPlayStatus[receiver.id] ?? .idle) == .idle {
+            Task { await connectRoom(receiver) }
+        }
+    }
+
+    /// Sends Lyra's music to the AirPlay rooms while any is connected, and holds this Mac's
+    /// speakers back by the AirPlay buffer so every room plays the same moment.
+    private func updateAirPlayRouting() {
+        let active = airPlayStatus.values.contains(.playing)
+        if active {
+            let input = streamer.input
+            let sink: @Sendable ([Int16], UInt64) -> Void = { samples, capturedAt in
+                input.push(samples, capturedAt: capturedAt)
+            }
+            player.setAirPlaySink(sink)
+            player.setLocalDelay(AirPlayStreamer.baseLatency)
+        } else {
+            player.setAirPlaySink(nil)
+            player.setLocalDelay(0)
+        }
+    }
+
+    private func connectRoom(_ receiver: AirPlayReceiver) async {
+        let settings = roomSettings(receiver.id)
+        airPlayStatus[receiver.id] = .connecting
+        do {
+            try await streamer.connect(receiver, volume: Float(settings.volume), delay: settings.delay)
+            airPlayStatus[receiver.id] = selectedAirPlayIDs.contains(receiver.id) ? .playing : .idle
+            if !selectedAirPlayIDs.contains(receiver.id) { await streamer.disconnect(receiver.id) }
+        } catch {
+            airPlayStatus[receiver.id] = .failed(error.localizedDescription)
+        }
+        updateAirPlayRouting()
+    }
+
+    /// Plays chirps in one ticked room, hears them with this Mac's microphone, and sets that
+    /// room's delay so it sounds exactly when Lyra's clock says. Stand in the room to run it.
+    func calibrate(_ receiver: AirPlayReceiver) async {
+        guard airPlayStatus[receiver.id] == .playing else {
+            calibrationMessage[receiver.id] = "Tick the room and wait for it to connect first."
+            return
+        }
+        let wasPlaying = player.isPlaying
+        if wasPlaying { player.pause() }
+        defer { if wasPlaying { player.resume() } }
+        calibratingID = receiver.id
+        defer { calibratingID = nil }
+        calibrationMessage[receiver.id] = "Listening…"
+
+        let delay = roomSettings(receiver.id).delay
+        do {
+            let result = try await RoomCalibration.measure(streamer: streamer, receiverID: receiver.id, delay: delay)
+            let range = AirPlayStreamer.delayRange
+            let corrected = min(range.upperBound, max(range.lowerBound, ((delay - result.error) * 100).rounded() / 100))
+            setRoomDelay(corrected, for: receiver.id)
+            calibrationMessage[receiver.id] = String(format: "Heard %+.0f ms off; delay set to %+.2f s.",
+                                                     result.error * 1000, corrected)
+        } catch {
+            calibrationMessage[receiver.id] = error.localizedDescription
+        }
+    }
+
+    func roomSettings(_ id: String) -> AirPlayRoomSettings {
+        airPlayRooms[id] ?? AirPlayRoomSettings()
+    }
+
+    func setRoomVolume(_ volume: Double, for id: String) {
+        updateRoom(id) { $0.volume = volume }
+        Task { await streamer.setVolume(Float(volume), for: id) }
+    }
+
+    func setRoomDelay(_ delay: Double, for id: String) {
+        updateRoom(id) { $0.delay = delay }
+        Task { await streamer.setDelay(delay, for: id) }
+    }
+
+    private func updateRoom(_ id: String, _ change: (inout AirPlayRoomSettings) -> Void) {
+        var settings = roomSettings(id)
+        change(&settings)
+        airPlayRooms[id] = settings
+        if let data = try? JSONEncoder().encode(airPlayRooms) {
+            defaults.set(data, forKey: DefaultsKey.airPlayRooms)
+        }
+    }
+
+    /// Connects to one receiver, plays a 3-second tone, and disconnects. Lyra's own music
+    /// pauses for the test so the tone is easy to hear, and resumes afterwards.
+    func playTestTone(on receiver: AirPlayReceiver) async {
+        let settings = roomSettings(receiver.id)
+        let wasPlaying = player.isPlaying
+        if wasPlaying { player.pause() }
+        defer { if wasPlaying { player.resume() } }
+        airPlayStatus[receiver.id] = .connecting
+        do {
+            try await streamer.connect(receiver, volume: Float(settings.volume), delay: settings.delay)
+            airPlayStatus[receiver.id] = .playing
+            await streamer.playTestTone(seconds: 3)
+            // The receiver plays ~2 s behind; let the tone finish before hanging up.
+            try? await Task.sleep(for: .seconds(3 + AirPlayStreamer.baseLatency + max(0, settings.delay) + 0.5))
+            // A ticked room stays connected after its test.
+            if selectedAirPlayIDs.contains(receiver.id) {
+                airPlayStatus[receiver.id] = .playing
+            } else {
+                await streamer.disconnect(receiver.id)
+                airPlayStatus[receiver.id] = .idle
+            }
+        } catch {
+            if !selectedAirPlayIDs.contains(receiver.id) { await streamer.disconnect(receiver.id) }
+            airPlayStatus[receiver.id] = .failed(error.localizedDescription)
+        }
     }
 
     /// Runs a throwing call, reporting failure through `errorMessage`.
